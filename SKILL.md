@@ -1,6 +1,7 @@
 ---
 name: gemini
 description: Use when the user asks to run Gemini CLI or references Google Gemini for code analysis, refactoring, or automated editing
+user-invocable: true
 ---
 
 # Gemini Skill Guide
