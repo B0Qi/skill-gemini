@@ -40,11 +40,11 @@ Use gemini to analyze this repository for potential refactoring opportunities.
 
 **Claude Code response:**
 Claude will activate the Gemini skill and:
-1. Ask which model to use (e.g., `gemini-2.5-pro`).
+1. Ask which model to use (e.g., `gemini-3-pro-preview`).
 2. Ask which approval mode (`plan`, `auto_edit`, or `yolo`).
 3. Run a command like:
 ```bash
-gemini -m gemini-2.5-pro --approval-mode plan \
+gemini -m gemini-3-pro-preview --approval-mode plan \
   -p "Analyze this repository for refactoring opportunities..." 2>/dev/null
 ```
 

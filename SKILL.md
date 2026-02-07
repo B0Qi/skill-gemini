@@ -10,12 +10,22 @@ user-invocable: true
 
 This skill enables Claude Code to invoke the Gemini CLI for code analysis, refactoring, and automated editing. It mirrors the codex skill's collaboration model but adapts to Gemini's CLI semantics.
 
+## Available Models
+
+| Model | Use case |
+| --- | --- |
+| `gemini-3-pro-preview` | Default. Most capable, best for complex tasks |
+| `gemini-3-flash-preview` | Fast, good for simpler tasks and iteration |
+| `gemini-2.5-pro` | Previous generation, stable |
+| `gemini-2.5-flash` | Fast previous generation |
+| `gemini-2.5-flash-lite` | Lightweight, lowest latency |
+
 ## Running a Task
 
 1. Confirm the Task Package exists and is complete.
-2. Ask the user (via `AskUserQuestion`) which model to run (e.g., `gemini-2.5-pro`) AND which approval mode to use (see Approval Mode Selection) in a **single prompt with two questions**.
+2. Ask the user (via `AskUserQuestion`) which model to run (default: `gemini-3-pro-preview`) AND which approval mode to use (see Approval Mode Selection) in a **single prompt with two questions**.
 3. Assemble the command with the appropriate options:
-   - `-m, --model <MODEL>` (default: `gemini-2.5-pro`)
+   - `-m, --model <MODEL>` (default: `gemini-3-pro-preview`)
    - `--approval-mode <plan|auto_edit|yolo>` or `-y` for full auto
    - `-p "<task package prompt>"` for headless execution
    - `-o json` for structured output (optional)
@@ -28,16 +38,16 @@ This skill enables Claude Code to invoke the Gemini CLI for code analysis, refac
 
 ```bash
 # Execute (headless)
-gemini -m gemini-2.5-pro --approval-mode auto_edit -p "<task package>" 2>/dev/null
+gemini -m gemini-3-pro-preview --approval-mode auto_edit -p "<task package>" 2>/dev/null
 
 # Read-only analysis
-gemini -m gemini-2.5-pro --approval-mode plan -p "<prompt>" 2>/dev/null
+gemini -m gemini-3-pro-preview --approval-mode plan -p "<prompt>" 2>/dev/null
 
 # Full auto (YOLO)
-gemini -m gemini-2.5-pro -y -p "<prompt>" 2>/dev/null
+gemini -m gemini-3-pro-preview -y -p "<prompt>" 2>/dev/null
 
 # With structured output
-gemini -m gemini-2.5-pro --approval-mode auto_edit -o json -p "<prompt>" 2>/dev/null
+gemini -m gemini-3-pro-preview --approval-mode auto_edit -o json -p "<prompt>" 2>/dev/null
 ```
 
 ## Approval Mode Selection
@@ -46,11 +56,13 @@ Choose the minimum required access. Prefer least privilege.
 
 | Use case | Gemini flags | Description |
 | --- | --- | --- |
-| Read-only analysis | `--approval-mode plan` | Gemini plans but cannot write files |
+| Read-only analysis | `--approval-mode plan` | Gemini plans but cannot write files. **Requires `experimental.plan` enabled in Gemini config.** |
 | Auto-approve edits | `--approval-mode auto_edit` | Gemini can write files, auto-approves edits |
 | Full auto (YOLO) | `-y` or `--approval-mode yolo` | No approval prompts at all |
 
-If unsure, default to `--approval-mode plan` and ask if writes are needed.
+**Note:** `--approval-mode plan` requires the experimental plan feature to be enabled. If unavailable, use `--approval-mode auto_edit` without `-y` as the least-privilege alternative for tasks that need file access.
+
+If unsure, default to `--approval-mode auto_edit` and ask if full auto is needed.
 
 ## Working Directory Handling
 
@@ -155,7 +167,7 @@ For serial mode, `Mode`, `Branch`, `Worktree`, and `Ownership` fields may be omi
 Gemini supports structured JSON output via the `-o json` flag. Use this when you need to parse results programmatically:
 
 ```bash
-gemini -m gemini-2.5-pro --approval-mode plan -o json -p "<prompt>" 2>/dev/null
+gemini -m gemini-3-pro-preview --approval-mode plan -o json -p "<prompt>" 2>/dev/null
 ```
 
 When `-o json` is not used, Gemini outputs plain text which Claude Code should summarize for the user.
