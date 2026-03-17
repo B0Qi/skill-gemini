@@ -1,0 +1,259 @@
+#!/bin/bash
+# gm-run — launch Gemini and watch to completion in one command.
+#
+# Mirrors cx-run's interface for Codex. Handles the full lifecycle:
+# launch → session registry → PID watch → state files → result JSON.
+# Designed for Claude Code's run_in_background — zero polling.
+#
+# Uses -o stream-json to get structured JSONL output with session_id
+# and token/timing stats.
+#
+# Usage:
+#   gm-run [OPTIONS] -- gemini -m gemini-3-pro-preview -y -p "$PROMPT"
+#   gm-run --resume INDEX [OPTIONS] -- -p "$RESUME_PROMPT"
+#
+# Options:
+#   --coord-id ID       Coord ID (default: gm_<timestamp>)
+#   --coord-dir DIR     .coord directory (default: .coord)
+#   --timeout SECONDS   Max wait time (default: 600)
+#   --max-chars N       Truncate response output (default: 12288)
+#   --resume INDEX      Resume a previous session by index or "latest"
+#   --cwd DIR           Working directory for gemini (cd before launch)
+#
+# Output: JSON to stdout on completion
+# Exit codes: 0=completed, 2=crashed, 4=timeout
+#
+# Stream-JSON format (from gemini -o stream-json):
+#   {"type":"init","session_id":"uuid","model":"..."}
+#   {"type":"message","role":"user","content":"..."}
+#   {"type":"message","role":"assistant","content":"...","delta":true}
+#   {"type":"result","status":"success","stats":{"total_tokens":N,"duration_ms":N,...}}
+
+set -uo pipefail
+
+COORD_ID="gm_$(date +%s)"
+COORD_DIR=".coord"
+TIMEOUT=600
+MAX_CHARS=12288
+RESUME_INDEX=""
+WORK_DIR=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --coord-id)  COORD_ID="$2"; shift 2;;
+    --coord-dir) COORD_DIR="$2"; shift 2;;
+    --timeout)   TIMEOUT="$2";   shift 2;;
+    --max-chars) MAX_CHARS="$2";  shift 2;;
+    --resume)    RESUME_INDEX="$2"; shift 2;;
+    --cwd)       WORK_DIR="$2";  shift 2;;
+    --)          shift; break;;
+    *)           break;;
+  esac
+done
+
+mkdir -p "$COORD_DIR/running" "$COORD_DIR/done" "$COORD_DIR/failed"
+
+JSONL="$(mktemp -t gemini.XXXXXX.jsonl)"
+ERROR_FILE="$(mktemp -t gemini.XXXXXX.err)"
+START_TIME="$(date +%s)"
+START_ISO="$(date -Iseconds)"
+
+# ── Helper: write heartbeat ──────────────────────────────────────
+write_heartbeat() {
+  cat > "$COORD_DIR/running/$COORD_ID.json" <<EOFHB
+{"coord_id":"$COORD_ID","agent":"gemini","pid":$1,"last_active":"$(date -Iseconds)","started_at":"$START_ISO"}
+EOFHB
+}
+
+# ── Helper: extract session_id from JSONL init event ─────────────
+extract_session_id() {
+  python3 -c "
+import json, sys
+for line in open('$JSONL'):
+    try:
+        obj = json.loads(line)
+        if obj.get('type') == 'init' and 'session_id' in obj:
+            print(obj['session_id'])
+            sys.exit(0)
+    except: pass
+" 2>/dev/null
+}
+
+# ── Helper: parse result from JSONL ──────────────────────────────
+parse_result() {
+  local jsonl_path="$1" max_chars="$2" cid="$3" elapsed="$4"
+  python3 -c "
+import json
+
+jsonl_path = '$jsonl_path'
+max_chars = int('$max_chars')
+coord_id = '$cid'
+elapsed = int('$elapsed')
+
+session_id = ''
+response_parts = []
+result_stats = {}
+result_status = 'unknown'
+
+for line in open(jsonl_path):
+    try:
+        obj = json.loads(line)
+        t = obj.get('type', '')
+        if t == 'init':
+            session_id = obj.get('session_id', '')
+        elif t == 'message' and obj.get('role') == 'assistant':
+            content = obj.get('content', '')
+            if content:
+                response_parts.append(content)
+        elif t == 'result':
+            result_status = obj.get('status', 'unknown')
+            result_stats = obj.get('stats', {})
+    except:
+        pass
+
+full_response = ''.join(response_parts)
+truncated = len(full_response) > max_chars
+response = full_response[:max_chars]
+
+output = {
+    'status': 'completed' if result_status == 'success' else 'crashed',
+    'coord_id': coord_id,
+    'agent': 'gemini',
+    'session_id': session_id,
+    'response': response,
+    'response_truncated': truncated,
+    'total_tokens': result_stats.get('total_tokens', 0),
+    'output_tokens': result_stats.get('output_tokens', 0),
+    'duration_ms': result_stats.get('duration_ms', 0),
+    'tool_calls': result_stats.get('tool_calls', 0),
+    'elapsed_seconds': elapsed,
+    'output_file': jsonl_path
+}
+print(json.dumps(output))
+"
+}
+
+# ── Check if -o is already in args ───────────────────────────────
+has_output_flag() {
+  for arg in "$@"; do
+    [[ "$arg" == "-o" || "$arg" == "--output-format" ]] && return 0
+  done
+  return 1
+}
+
+# ── Resume mode ──────────────────────────────────────────────────
+if [ -n "$RESUME_INDEX" ]; then
+  if [ -n "$WORK_DIR" ]; then
+    (cd "$WORK_DIR" && gemini --resume "$RESUME_INDEX" -o stream-json "$@" >"$JSONL" 2>"$ERROR_FILE") &
+  else
+    gemini --resume "$RESUME_INDEX" -o stream-json "$@" >"$JSONL" 2>"$ERROR_FILE" &
+  fi
+  CMD_PID=$!
+
+  # Register resume
+  printf '{"agent":"gemini","coord_id":"%s","session_ref":{"type":"index","value":"%s"},"status":"running","cwd":"%s","created_at":"%s","resumed":true}\n' \
+    "$COORD_ID" "$RESUME_INDEX" "${WORK_DIR:-$(pwd)}" "$START_ISO" \
+    >> "$COORD_DIR/sessions.jsonl" 2>/dev/null || true
+
+  write_heartbeat "$CMD_PID"
+else
+  # ── Normal launch mode ─────────────────────────────────────────
+  if [ $# -eq 0 ]; then
+    echo '{"status":"error","error":"No command. Usage: gm-run [OPTIONS] -- gemini ..."}' >&2
+    exit 1
+  fi
+
+  # Build command with -o stream-json injected if not present
+  if has_output_flag "$@"; then
+    LAUNCH_ARGS=("$@")
+  else
+    # Insert -o stream-json before the arguments
+    LAUNCH_ARGS=("$1" "-o" "stream-json" "${@:2}")
+  fi
+
+  if [ -n "$WORK_DIR" ]; then
+    (cd "$WORK_DIR" && "${LAUNCH_ARGS[@]}" >"$JSONL" 2>"$ERROR_FILE") &
+  else
+    "${LAUNCH_ARGS[@]}" >"$JSONL" 2>"$ERROR_FILE" &
+  fi
+  CMD_PID=$!
+
+  # Wait for session_id from JSONL init event (max 30s)
+  SESSION_ID=""
+  for _i in $(seq 1 60); do
+    if [ -s "$JSONL" ]; then
+      SESSION_ID="$(extract_session_id)" && [ -n "$SESSION_ID" ] && break
+    fi
+    sleep 0.5
+  done
+
+  # Register session
+  CMD_JSON="$(printf '%s' "$*" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')"
+  printf '{"agent":"gemini","coord_id":"%s","session_id":"%s","session_ref":{"type":"id","value":"%s"},"status":"running","command":%s,"cwd":"%s","mode":"serial","created_at":"%s"}\n' \
+    "$COORD_ID" "$SESSION_ID" "$SESSION_ID" "$CMD_JSON" "${WORK_DIR:-$(pwd)}" "$START_ISO" \
+    >> "$COORD_DIR/sessions.jsonl" 2>/dev/null || true
+
+  write_heartbeat "$CMD_PID"
+fi
+
+# ── Watch loop — block until completion or timeout ───────────────
+EXIT_CODE=0
+while true; do
+  if ! kill -0 "$CMD_PID" 2>/dev/null; then
+    wait "$CMD_PID" 2>/dev/null
+    PROC_EXIT=$?
+    ELAPSED=$(( $(date +%s) - START_TIME ))
+
+    rm -f "$COORD_DIR/running/$COORD_ID.json"
+
+    if [ "$PROC_EXIT" -eq 0 ]; then
+      cat > "$COORD_DIR/done/$COORD_ID.json" <<EOFDONE
+{"coord_id":"$COORD_ID","agent":"gemini","status":"completed","elapsed_seconds":$ELAPSED,"completed_at":"$(date -Iseconds)"}
+EOFDONE
+      # Parse structured result from JSONL
+      parse_result "$JSONL" "$MAX_CHARS" "$COORD_ID" "$ELAPSED"
+      EXIT_CODE=0
+    else
+      local_err=""
+      [ -f "$ERROR_FILE" ] && local_err="$(tail -c 500 "$ERROR_FILE")"
+      err_json="$(printf '%s' "$local_err" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')"
+      cat > "$COORD_DIR/failed/$COORD_ID.json" <<EOFFAIL
+{"coord_id":"$COORD_ID","agent":"gemini","status":"crashed","exit_code":$PROC_EXIT,"error":$err_json,"elapsed_seconds":$ELAPSED,"failed_at":"$(date -Iseconds)"}
+EOFFAIL
+      echo "{\"status\":\"crashed\",\"coord_id\":\"$COORD_ID\",\"agent\":\"gemini\",\"exit_code\":$PROC_EXIT,\"error\":$err_json,\"elapsed_seconds\":$ELAPSED}"
+      EXIT_CODE=2
+    fi
+    break
+  fi
+
+  ELAPSED=$(( $(date +%s) - START_TIME ))
+  if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+    kill "$CMD_PID" 2>/dev/null
+    sleep 1
+    kill -9 "$CMD_PID" 2>/dev/null
+    wait "$CMD_PID" 2>/dev/null
+
+    rm -f "$COORD_DIR/running/$COORD_ID.json"
+    cat > "$COORD_DIR/failed/$COORD_ID.json" <<EOFTO
+{"coord_id":"$COORD_ID","agent":"gemini","status":"timeout","elapsed_seconds":$ELAPSED,"timeout":$TIMEOUT,"failed_at":"$(date -Iseconds)"}
+EOFTO
+    echo "{\"status\":\"timeout\",\"coord_id\":\"$COORD_ID\",\"agent\":\"gemini\",\"elapsed_seconds\":$ELAPSED,\"timeout\":$TIMEOUT}"
+    EXIT_CODE=4
+    break
+  fi
+
+  write_heartbeat "$CMD_PID"
+  sleep 2
+done
+
+# ── Update registry ──────────────────────────────────────────────
+FINAL_STATUS="done"
+[ -f "$COORD_DIR/failed/$COORD_ID.json" ] && FINAL_STATUS="failed"
+[ $EXIT_CODE -eq 4 ] && FINAL_STATUS="timeout"
+
+printf '{"agent":"gemini","coord_id":"%s","status":"%s","updated_at":"%s"}\n' \
+  "$COORD_ID" "$FINAL_STATUS" "$(date -Iseconds)" \
+  >> "$COORD_DIR/sessions.jsonl" 2>/dev/null || true
+
+rm -f "$ERROR_FILE"
+exit $EXIT_CODE

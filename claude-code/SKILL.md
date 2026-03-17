@@ -22,19 +22,60 @@ This skill enables Claude Code to invoke the Gemini CLI for code analysis, refac
 
 ## Running a Task
 
-1. Confirm the Task Package exists and is complete.
-2. Ask the user (via `AskUserQuestion`) which model to run (default: `gemini-3-pro-preview`) AND which approval mode to use (see Approval Mode Selection) in a **single prompt with two questions**.
-3. Assemble the command with the appropriate options:
-   - `-m, --model <MODEL>` (default: `gemini-3-pro-preview`)
-   - `--approval-mode <plan|auto_edit|yolo>` or `-y` for full auto
-   - `-p "<task package prompt>"` for headless execution
-   - `-o json` for structured output (optional)
-4. **IMPORTANT**: Append `2>/dev/null` to all `gemini` commands to suppress noisy stderr. Only show stderr if the user explicitly requests it or if debugging is needed. **On non-zero exit**, re-run without `2>/dev/null` to capture error details before reporting.
-5. Run the command, capture output, and summarize the outcome for the user.
-6. **After launching Gemini**, record a session entry in `.coord/sessions.jsonl` (see Session Management).
-7. **After Gemini completes**, update the registry entry status to `done` and inform the user: "You can resume this Gemini session at any time by saying 'gemini resume' or asking me to continue."
+### Quick Launch (preferred): `gm-run`
 
-### Command Patterns
+Use `gm-run` (`scripts/gm-run`) for the full lifecycle — launch, session registry, PID monitoring, state files, result JSON. Mirrors `cx-run` from the Codex skill.
+
+```bash
+$HOME/.claude/skills/gemini/scripts/gm-run --timeout 600 -- \
+  gemini -m gemini-3-pro-preview -y -p "$PROMPT"
+```
+
+`gm-run` automatically:
+- Injects `-o stream-json` to get structured JSONL with `session_id` and token/timing stats
+- Launches gemini in background, monitors PID
+- Extracts `session_id` from the stream's `init` event
+- Registers in `.coord/sessions.jsonl` (with real `session_id`, not volatile index)
+- Manages `.coord/running/done/failed/` state files with heartbeat
+- Outputs result JSON on completion
+- Handles timeout (kills process, writes failed state)
+
+**Output** (JSON to stdout on completion):
+```json
+{"status":"completed","session_id":"uuid","response":"...","response_truncated":false,"total_tokens":18611,"output_tokens":31,"duration_ms":4274,"tool_calls":1,"elapsed_seconds":13}
+```
+
+**Options:**
+- `--timeout SECONDS` — max wait (default: 600)
+- `--max-chars N` — truncate response (default: 12288)
+- `--coord-id ID` — custom coord ID (default: `gm_<timestamp>`)
+- `--coord-dir DIR` — .coord directory (default: `.coord`)
+- `--cwd DIR` — working directory (gemini has no `-C` flag, so gm-run `cd`s for you)
+- `--resume INDEX` — resume a previous session by index or `"latest"`
+
+Run with `run_in_background` from Claude Code — you'll be notified on completion.
+
+### Launch Steps
+
+1. **Guard check**: scan `.coord/running/` for active entries. If any exist for this project, do NOT proceed — wait for notification or resume.
+2. Confirm the Task Package is complete.
+3. Ask the user which model (default: `gemini-3-pro-preview`) and approval mode in a **single prompt**.
+4. **For long/multiline prompts**, write to a temp file: `PROMPT=$(cat /path/to/task.txt)`.
+5. **Launch with `gm-run`** using `run_in_background`:
+   ```bash
+   $HOME/.claude/skills/gemini/scripts/gm-run --timeout 600 -- \
+     gemini -m gemini-3-pro-preview -y -p "$PROMPT"
+   ```
+   For worktree mode: add `--cwd /absolute/path/to/worktree`.
+6. **Tell the user** Gemini is running, then **stop**. Do NOT poll or edit files.
+7. **When notified**, read the result JSON and decide:
+   - `completed` → proceed to Accept phase
+   - `crashed` → investigate or resume
+   - `timeout` → resume with `gm-run --resume <index> --timeout 600 -- -p "Continue"`
+
+### Direct Command Patterns (without gm-run)
+
+For simple one-off commands where lifecycle management isn't needed:
 
 ```bash
 # Execute (headless)
@@ -46,9 +87,11 @@ gemini -m gemini-3-pro-preview --approval-mode plan -p "<prompt>" 2>/dev/null
 # Full auto (YOLO)
 gemini -m gemini-3-pro-preview -y -p "<prompt>" 2>/dev/null
 
-# With structured output
-gemini -m gemini-3-pro-preview --approval-mode auto_edit -o json -p "<prompt>" 2>/dev/null
+# With structured stream output (session_id + stats)
+gemini -m gemini-3-pro-preview -y -o stream-json -p "<prompt>"
 ```
+
+**IMPORTANT**: Append `2>/dev/null` to suppress noisy stderr on direct commands. **On non-zero exit**, re-run without `2>/dev/null` to capture error details.
 
 ## Approval Mode Selection
 
@@ -79,13 +122,15 @@ For serial mode in the current project directory, no special handling is needed.
 
 ### Recording Sessions
 
-After launching Gemini, record a session in `.coord/sessions.jsonl`:
+When using `gm-run`, sessions are registered automatically with the real `session_id` extracted from Gemini's stream-json `init` event. No manual registration needed.
+
+For direct commands, record a session in `.coord/sessions.jsonl`:
 
 ```json
-{"agent":"gemini","session_id":"gm-<timestamp>","session_ref":{"type":"index","value":0},"task":"<short task description>","status":"running","cwd":"<working dir>","mode":"serial","created_at":"<ISO8601>"}
+{"agent":"gemini","session_id":"<uuid-from-stream>","session_ref":{"type":"id","value":"<uuid>"},"task":"<short task description>","status":"running","cwd":"<working dir>","mode":"serial","created_at":"<ISO8601>"}
 ```
 
-The `session_ref.value` is the session index at time of creation. Since Gemini uses index-based session references that can shift, **always re-resolve the index before resuming**.
+**Tip:** Use `-o stream-json` to capture the `session_id` from the `init` event. This is more stable than index-based references.
 
 ### Listing Sessions
 
@@ -93,15 +138,15 @@ The `session_ref.value` is the session index at time of creation. Since Gemini u
 gemini --list-sessions
 ```
 
-This outputs all Gemini sessions. Parse the output to find the session matching your task description or timestamp.
+This outputs all Gemini sessions. Match by `session_id` (if captured via stream-json) or by task description/timestamp to find the correct index for resume.
 
 ### Context Recovery
 
 When Claude Code loses context:
-1. Read `.coord/sessions.jsonl` to find entries with `agent: "gemini"` and `status: "running"`.
-2. Run `gemini --list-sessions` to get the current session list.
-3. Match the recorded task description against the session list to find the correct current index.
-4. Resume using the resolved index (see Resume Protocol).
+1. Scan `.coord/running/` for active gemini state files — fastest way to detect in-flight tasks.
+2. Read `.coord/sessions.jsonl` (`tail -n 50`) to find `agent: "gemini"` entries.
+3. If a `done/` or `failed/` file exists for the coord_id, the task already finished — read the result.
+4. Otherwise, run `gemini --list-sessions`, match by session_id or task description, and resume.
 
 ## Resume Protocol
 
